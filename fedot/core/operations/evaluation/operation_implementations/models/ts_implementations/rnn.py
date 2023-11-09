@@ -1,7 +1,4 @@
-from typing import Optional
-
 import numpy as np
-from scipy.stats import ttest_rel
 
 from fedot.core.data.data import InputData
 from golem.utilities.requirements_notificator import warn_requirement
@@ -12,7 +9,7 @@ from fedot.core.operations.operation_parameters import OperationParameters
 
 try:
     import torch
-    from torch.nn import GRU, Linear, Dropout, MSELoss, BatchNorm1d
+    from torch.nn import GRU, LSTM, RNN, Linear, Dropout, MSELoss, BatchNorm1d
     from torch.optim import Adam
     from torch.utils.data import TensorDataset, DataLoader
 except ModuleNotFoundError:
@@ -21,23 +18,43 @@ except ModuleNotFoundError:
 
 
 class RNNImplementation(ModelImplementation):
+    """__init__(self, params: OperationParameters)
+
+    The implementation class of RNN models. Provides Jordan-RNN, Elman-RNN, LSTM and GRU models.
+
+    params: parameters of model. The following parameters are supported:
+        rnn_type: type of RNN model implementation. It can take one of the following values:
+            'gru', 'lstm', 'rnn_elman' or 'rnn_jordan'. Default: 'rnn_elman'
+        max_step: maximum steps number for optimization. Default: 300;
+
+        dropout: If non-zero, introduces a `Dropout` layer on the outputs of each RNN model layer
+        except the last layer, with dropout probability equal to :attr:`dropout`. Default: 0;
+
+        hidden_size: The number of features in the hidden stat. Default: round(data.features.shape[1] * 2 / (1 - dropout));
+
+        num_layers: number of recurrent layers. Default: 3;
+
+        seed: random_seed number.
+
+    """
     def __init__(self, params: OperationParameters):
         super().__init__(params)
 
         self.device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
-        self.max_step = params.get('max_step') or 500
-        self.seed = params.get('seed')
+        self.type_rnn = params.get('rnn_type') or 'rnn_elman'
         self.model = None
+        self.max_step = params.get('max_step') or 500
         self.batch_size = 50
         self.validation_size = 0.2
+        self.preprocessing_type = 'normalization'
+        self.preprocessing_params = dict()
+        self.seed = params.get('seed')
+
         if self.seed is not None:
             self.generator = torch.Generator()
             self.generator.manual_seed(self.seed)
         else:
             self.generator = None
-
-        self.preprocessing_type = 'normalization'
-        self.preprocessing_params = dict()
 
     def preprocessing(self, x, parameters_defining=False):
         if parameters_defining not in (True, False):
@@ -86,18 +103,30 @@ class RNNImplementation(ModelImplementation):
         return torch.randn(*self.hidden_size, generator=self.generator)
 
     def fit(self, data: InputData):
-        if self.model is None:
-            # TODO: choose layers count and hidden size accrodance to amount of data
-            #       if there is a small dataset then big gru cannot be fitted
-            dropout = self.params.get('dropout') or 0.1
-            hidden_size = (self.params.get('hidden_size') or
-                           round(data.features.shape[1] * 2 / (1 - dropout)))
-            layer_count = self.params.get('layers_count') or 3
+        # TODO: choose num_layers and hidden_size accordance to amount of data
+        #       if there is a small dataset then big gru cannot be fitted
+        dropout = self.params.get('dropout') or 0.0
+        hidden_size = (self.params.get('hidden_size') or
+                        round(data.features.shape[1] * 2 / (1 - dropout)))
+        num_layers = self.params.get('num_layers') or 3
 
+        if self.type_rnn == 'gru':
             self.model = GRUModel(input_data_length=data.features.shape[1],
                                   output_data_length=data.task.task_params.forecast_length,
                                   hidden_size=hidden_size,
-                                  layer_count=layer_count,
+                                  num_layers=num_layers,
+                                  dropout=dropout)
+        elif self.type_rnn == 'lstm':
+            self.model = LSTMModel(input_data_length=data.features.shape[1],
+                                   output_data_length=data.task.task_params.forecast_length,
+                                   hidden_size=hidden_size,
+                                   num_layers=num_layers,
+                                   dropout=dropout)
+        elif self.type_rnn == 'rnn_elman':
+            self.model = RNNModel(input_data_length=data.features.shape[1],
+                                  output_data_length=data.task.task_params.forecast_length,
+                                  hidden_size=hidden_size,
+                                  num_layers=num_layers,
                                   dropout=dropout)
 
         # prepare objects
@@ -106,7 +135,7 @@ class RNNImplementation(ModelImplementation):
         model.train()
         loss_fun = MSELoss(reduction="mean")
         opt_fun = Adam(model.parameters(), lr=1e-3)
-        self.hidden_size = (model.gru.input_size * model.gru.num_layers, self.batch_size, model.gru.hidden_size)
+        self.hidden_size = (model.rnn.input_size * model.rnn.num_layers, self.batch_size, model.rnn.hidden_size)
 
         # prepare data
         x, y = data.features, data.target
@@ -116,7 +145,7 @@ class RNNImplementation(ModelImplementation):
         batch_count = int(x.shape[0] / self.batch_size)
         train_count = int(batch_count * (1 - self.validation_size))
 
-        def fit_step(count_range, x=x, y=y, model=model,loss_fun=loss_fun,
+        def fit_step(count_range, x=x, y=y, model=model, loss_fun=loss_fun,
                      opt_fun=opt_fun, grad=True):
             _losses = []
             h = self.initialize_hidden().to(self.device)
@@ -155,24 +184,87 @@ class RNNImplementation(ModelImplementation):
 
 
 class GRUModel(torch.nn.Module):
+    """__init__(self, input_data_length: int, output_data_length: int,
+                     num_layers: int, dropout: float, hidden_size: int)
+
+    GRU model implementation class.
+    """
     def __init__(self, input_data_length: int, output_data_length: int,
-                 layer_count: int, dropout: float, hidden_size: int):
+                 num_layers: int, dropout: float, hidden_size: int):
         super().__init__()
 
-        self.gru = GRU(input_size=1,
+        self.rnn = GRU(input_size=1,
                        hidden_size=hidden_size,
-                       num_layers=layer_count,
-                       dropout=dropout,
+                       num_layers=num_layers,
                        bias=True,
-                       bidirectional=False,
-                       batch_first=True)
+                       batch_first=True,
+                       dropout=dropout,
+                       bidirectional=False)
         self.linear = Linear(in_features=input_data_length * hidden_size,
                              out_features=output_data_length)
 
     def forward(self, x, h=None):
         if h is None:
-            x, h = self.gru(x, h)
+            x, h = self.rnn(x, h)
         else:
-            x, h = self.gru(x)
+            x, h = self.rnn(x)
+        x = self.linear(x.flatten(1))
+        return x, h
+
+
+class LSTMModel(torch.nn.Module):
+    """__init__(self, input_data_length: int, output_data_length: int,
+                 num_layers: int, dropout: float, hidden_size: int)
+
+    LSTM model implementation class.
+    """
+    def __init__(self, input_data_length: int, output_data_length: int,
+                 num_layers: int, dropout: float, hidden_size: int):
+        super().__init__()
+
+        self.rnn = LSTM(input_size=1,
+                         hidden_size=hidden_size,
+                         num_layers=num_layers,
+                         bias=True,
+                         batch_first=True,
+                         dropout=dropout,
+                         bidirectional=False)
+        self.linear = Linear(in_features=input_data_length * hidden_size,
+                             out_features=output_data_length)
+
+    def forward(self, x, h=None):
+        if h is None:
+            x, h = self.rnn(x, h)
+        else:
+            x, h = self.rnn(x)
+        x = self.linear(x.flatten(1))
+        return x, h
+
+
+class RNNModel(torch.nn.Module):
+    """__init__(self, input_data_length: int, output_data_length: int,
+                     num_layers: int, dropout: float, hidden_size: int)
+
+    Elman-RNN model implementation class.
+    """
+    def __init__(self, input_data_length: int, output_data_length: int,
+                 num_layers: int, dropout: float, hidden_size: int):
+        super().__init__()
+
+        self.rnn = RNN(input_size=1,
+                       hidden_size=hidden_size,
+                       num_layers=num_layers,
+                       bias=True,
+                       batch_first=True,
+                       dropout=dropout,
+                       bidirectional=False)
+        self.linear = Linear(in_features=input_data_length * hidden_size,
+                             out_features=output_data_length)
+
+    def forward(self, x, h=None):
+        if h is None:
+            x, h = self.rnn(x, h)
+        else:
+            x, h = self.rnn(x)
         x = self.linear(x.flatten(1))
         return x, h
