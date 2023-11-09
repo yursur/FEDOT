@@ -160,7 +160,7 @@
         "non_linear"
       ]
     },
-    "gru": {
+    "rnn": {
       "meta": "ts_model",
       "presets": ["ts"],
       "tags": [

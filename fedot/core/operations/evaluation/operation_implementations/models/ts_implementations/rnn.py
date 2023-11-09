@@ -20,7 +20,7 @@ except ModuleNotFoundError:
     torch = object()
 
 
-class GRUImplementation(ModelImplementation):
+class RNNImplementation(ModelImplementation):
     def __init__(self, params: OperationParameters):
         super().__init__(params)
 
