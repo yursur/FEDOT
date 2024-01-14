@@ -1,4 +1,5 @@
 import numpy as np
+from typing import Union
 
 from fedot.core.data.data import InputData
 from golem.utilities.requirements_notificator import warn_requirement
@@ -9,7 +10,7 @@ from fedot.core.operations.operation_parameters import OperationParameters
 
 try:
     import torch
-    from torch.nn import GRU, LSTM, RNN, Linear, Dropout, MSELoss, BatchNorm1d
+    from torch.nn import GRU, LSTM, RNN, Linear, Dropout, MSELoss, BatchNorm1d, Conv1d, Sequential, ReLU
     from torch.optim import Adam
     from torch.utils.data import TensorDataset, DataLoader
 except ModuleNotFoundError:
@@ -22,26 +23,25 @@ class RNNImplementation(ModelImplementation):
 
     The implementation class of RNN models. Provides Jordan-RNN, Elman-RNN, LSTM and GRU models.
 
-    params: parameters of model. The following parameters are supported:
-        rnn_type: type of RNN model implementation. It can take one of the following values:
+    **params (dict)**: parameters of model. The following parameters are supported:
+        *rnn_type (str)*: type of RNN model implementation. It can take one of the following values:
             'gru', 'lstm', 'rnn_elman' or 'rnn_jordan'. Default: 'rnn_elman'
-        max_step: maximum steps number for optimization. Default: 300;
+        *max_step (int)*: maximum steps number for optimization. Default: 300;
 
-        dropout: If non-zero, introduces a `Dropout` layer on the outputs of each RNN model layer
+        *dropout (float)*: If non-zero, introduces a `Dropout` layer on the outputs of each RNN model layer
         except the last layer, with dropout probability equal to :attr:`dropout`. Default: 0;
 
-        hidden_size: The number of features in the hidden stat. Default: round(data.features.shape[1] * 2 / (1 - dropout));
+        *hidden_size (int)*: The number of features in the hidden stat. Default: round(data.features.shape[1] * 2 / (1 - dropout));
 
-        num_layers: number of recurrent layers. Default: 3;
+        *num_layers (int)*: number of recurrent layers. Default: 3;
 
-        seed: random_seed number.
+        *seed (int)*: random_seed number.
 
     """
     def __init__(self, params: OperationParameters):
         super().__init__(params)
 
         self.device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
-        self.type_rnn = params.get('rnn_type') or 'rnn_elman'
         self.model = None
         self.max_step = params.get('max_step') or 500
         self.batch_size = 50
@@ -55,6 +55,11 @@ class RNNImplementation(ModelImplementation):
             self.generator.manual_seed(self.seed)
         else:
             self.generator = None
+
+        self.type_rnn = params.get('rnn_type') or 'rnn_elman'
+        if self.type_rnn not in ['rnn_elman', 'rnn_jordan', 'lstm', 'gru']:
+            raise ValueError((f"Unknown type of RNN: {self.type_rnn}."
+                              f" Allowed types: 'rnn_elman', 'rnn_jordan', 'lstm', 'gru'"))
 
     def preprocessing(self, x, parameters_defining=False):
         if parameters_defining not in (True, False):
@@ -109,24 +114,33 @@ class RNNImplementation(ModelImplementation):
         hidden_size = (self.params.get('hidden_size') or
                         round(data.features.shape[1] * 2 / (1 - dropout)))
         num_layers = self.params.get('num_layers') or 3
+        conv_layers = self.params.get('conv_layers') or None
+        conv_params = {'out_channels': self.params.get('conv_out_channels') or None,
+                       'kernel_size': self.params.get('conv_kernel_size') or None}
 
         if self.type_rnn == 'gru':
             self.model = GRUModel(input_data_length=data.features.shape[1],
                                   output_data_length=data.task.task_params.forecast_length,
                                   hidden_size=hidden_size,
                                   num_layers=num_layers,
+                                  conv_layers=conv_layers,
+                                  conv_params=conv_params,
                                   dropout=dropout)
         elif self.type_rnn == 'lstm':
             self.model = LSTMModel(input_data_length=data.features.shape[1],
                                    output_data_length=data.task.task_params.forecast_length,
                                    hidden_size=hidden_size,
                                    num_layers=num_layers,
+                                   conv_layers=conv_layers,
+                                   conv_params=conv_params,
                                    dropout=dropout)
         elif self.type_rnn == 'rnn_elman':
             self.model = RNNModel(input_data_length=data.features.shape[1],
                                   output_data_length=data.task.task_params.forecast_length,
                                   hidden_size=hidden_size,
                                   num_layers=num_layers,
+                                  conv_layers=conv_layers,
+                                  conv_params=conv_params,
                                   dropout=dropout)
 
         # prepare objects
@@ -184,14 +198,32 @@ class RNNImplementation(ModelImplementation):
 
 
 class GRUModel(torch.nn.Module):
-    """__init__(self, input_data_length: int, output_data_length: int,
-                     num_layers: int, dropout: float, hidden_size: int)
+    """__init__(self, input_data_length: int, output_data_length: int, num_layers: int, dropout: float, hidden_size: int)
 
-    GRU model implementation class.
+    **GRU** model implementation class.
     """
-    def __init__(self, input_data_length: int, output_data_length: int,
-                 num_layers: int, dropout: float, hidden_size: int):
+    def __init__(self, input_data_length: int, output_data_length: int, num_layers: int, dropout: float,
+                 hidden_size: int, conv_layers: Union[None, int], conv_params: Union[None, dict]):
         super().__init__()
+
+        if conv_layers is not None and conv_layers > 0:
+
+            assert conv_params.get['out_channels'] is None, "If convolutional layers are used the parameter 'conv_output_channels' must be determined."
+            assert len(conv_params.get['out_channels']) != conv_layers, f"There are {conv_layers} convolutional layers, \
+            but only for {len(conv_params.get['out_channels'])} layers the 'conv_out_channels' parameter is specified."
+            assert len(conv_params.get['kernel_size']) != conv_layers, f"There are {conv_layers} convolutional layers, \
+                        but only for {len(conv_params.get['kernel_size'])} layers the 'conv_kernel_size' parameter is specified."
+
+            self.conv = torch.nn.Sequential()
+            self.conv.add_module("conv_1", torch.nn.Conv1d(in_channels=input_data_length,
+                                                           out_channels=conv_params.get['out_channels'][0],
+                                                           kernel_size=conv_params.get['kernel_size'][0]))
+            self.conv.add_module("relu_1", torch.nn.ReLU())
+            for l in range(1, conv_layers):
+                self.conv.add_module(f"conv_{l+1}", torch.nn.Conv1d(in_channels=conv_params.get['out_channels'][l-1],
+                                                                    out_channels=conv_params.get['out_channels'][l],
+                                                                    kernel_size=conv_params.get['kernel_size'][l]))
+                self.conv.add_module(f"relu_{l+1}", torch.nn.ReLU())
 
         self.rnn = GRU(input_size=1,
                        hidden_size=hidden_size,
@@ -200,10 +232,13 @@ class GRUModel(torch.nn.Module):
                        batch_first=True,
                        dropout=dropout,
                        bidirectional=False)
+
         self.linear = Linear(in_features=input_data_length * hidden_size,
                              out_features=output_data_length)
 
     def forward(self, x, h=None):
+        if hasattr(self, 'conv'):
+            x = self.conv(x)
         if h is None:
             x, h = self.rnn(x, h)
         else:
@@ -213,14 +248,34 @@ class GRUModel(torch.nn.Module):
 
 
 class LSTMModel(torch.nn.Module):
-    """__init__(self, input_data_length: int, output_data_length: int,
-                 num_layers: int, dropout: float, hidden_size: int)
+    """__init__(self, input_data_length: int, output_data_length: int, num_layers: int, dropout: float, hidden_size: int)
 
-    LSTM model implementation class.
+    **LSTM** model implementation class.
     """
-    def __init__(self, input_data_length: int, output_data_length: int,
-                 num_layers: int, dropout: float, hidden_size: int):
+    def __init__(self, input_data_length: int, output_data_length: int, num_layers: int, dropout: float,
+                 hidden_size: int, conv_layers: Union[None, int], conv_params: Union[None, dict]):
         super().__init__()
+
+        if conv_layers is not None and conv_layers > 0:
+
+            assert conv_params.get[
+                       'out_channels'] is None, "If convolutional layers are used the parameter 'conv_output_channels' must be determined."
+            assert len(conv_params.get['out_channels']) != conv_layers, f"There are {conv_layers} convolutional layers, \
+            but only for {len(conv_params.get['out_channels'])} layers the 'conv_out_channels' parameter is specified."
+            assert len(conv_params.get['kernel_size']) != conv_layers, f"There are {conv_layers} convolutional layers, \
+                        but only for {len(conv_params.get['kernel_size'])} layers the 'conv_kernel_size' parameter is specified."
+
+            self.conv = torch.nn.Sequential()
+            self.conv.add_module("conv_1", torch.nn.Conv1d(in_channels=input_data_length,
+                                                           out_channels=conv_params.get['out_channels'][0],
+                                                           kernel_size=conv_params.get['kernel_size'][0]))
+            self.conv.add_module("relu_1", torch.nn.ReLU())
+            for l in range(1, conv_layers):
+                self.conv.add_module(f"conv_{l + 1}",
+                                     torch.nn.Conv1d(in_channels=conv_params.get['out_channels'][l - 1],
+                                                     out_channels=conv_params.get['out_channels'][l],
+                                                     kernel_size=conv_params.get['kernel_size'][l]))
+                self.conv.add_module(f"relu_{l + 1}", torch.nn.ReLU())
 
         self.rnn = LSTM(input_size=1,
                          hidden_size=hidden_size,
@@ -233,6 +288,8 @@ class LSTMModel(torch.nn.Module):
                              out_features=output_data_length)
 
     def forward(self, x, h=None):
+        if hasattr(self, 'conv'):
+            x = self.conv(x)
         if h is None:
             x, h = self.rnn(x, h)
         else:
@@ -242,14 +299,34 @@ class LSTMModel(torch.nn.Module):
 
 
 class RNNModel(torch.nn.Module):
-    """__init__(self, input_data_length: int, output_data_length: int,
-                     num_layers: int, dropout: float, hidden_size: int)
+    """__init__(self, input_data_length: int, output_data_length: int, num_layers: int, dropout: float, hidden_size: int)
 
-    Elman-RNN model implementation class.
+    **Elman-RNN** model implementation class.
     """
-    def __init__(self, input_data_length: int, output_data_length: int,
-                 num_layers: int, dropout: float, hidden_size: int):
+    def __init__(self, input_data_length: int, output_data_length: int, num_layers: int, conv: bool, dropout: float,
+                 hidden_size: int, conv_layers: Union[None, int], conv_params: Union[None, dict]):
         super().__init__()
+
+        if conv_layers is not None and conv_layers > 0:
+
+            assert conv_params.get[
+                       'out_channels'] is None, "If convolutional layers are used the parameter 'conv_output_channels' must be determined."
+            assert len(conv_params.get['out_channels']) != conv_layers, f"There are {conv_layers} convolutional layers, \
+            but only for {len(conv_params.get['out_channels'])} layers the 'conv_out_channels' parameter is specified."
+            assert len(conv_params.get['kernel_size']) != conv_layers, f"There are {conv_layers} convolutional layers, \
+                        but only for {len(conv_params.get['kernel_size'])} layers the 'conv_kernel_size' parameter is specified."
+
+            self.conv = torch.nn.Sequential()
+            self.conv.add_module("conv_1", torch.nn.Conv1d(in_channels=input_data_length,
+                                                           out_channels=conv_params.get['out_channels'][0],
+                                                           kernel_size=conv_params.get['kernel_size'][0]))
+            self.conv.add_module("relu_1", torch.nn.ReLU())
+            for l in range(1, conv_layers):
+                self.conv.add_module(f"conv_{l + 1}",
+                                     torch.nn.Conv1d(in_channels=conv_params.get['out_channels'][l - 1],
+                                                     out_channels=conv_params.get['out_channels'][l],
+                                                     kernel_size=conv_params.get['kernel_size'][l]))
+                self.conv.add_module(f"relu_{l + 1}", torch.nn.ReLU())
 
         self.rnn = RNN(input_size=1,
                        hidden_size=hidden_size,
@@ -262,6 +339,8 @@ class RNNModel(torch.nn.Module):
                              out_features=output_data_length)
 
     def forward(self, x, h=None):
+        if hasattr(self, 'conv'):
+            x = self.conv(x)
         if h is None:
             x, h = self.rnn(x, h)
         else:
