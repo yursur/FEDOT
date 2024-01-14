@@ -35,6 +35,12 @@ class RNNImplementation(ModelImplementation):
 
         *num_layers (int)*: number of recurrent layers. Default: 3;
 
+        *conv_layers (int)*: number of convolution layers (0, 1, 2 or 3) that need to be added before recurrent unit. Default: 0;
+
+        *conv_out_channels (int)*: number of output channels of conv layers block (if :attr:`conv_layers` > 0);
+
+        *conv_kernel_size (int)*: kernel size of conv layers (if :attr:`conv_layers` > 0);
+
         *seed (int)*: random_seed number.
 
     """
